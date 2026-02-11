@@ -11,20 +11,100 @@
     .muted { color: var(--muted); font-size: 13px; }
     .card { border: 1px solid var(--bd); border-radius: 12px; padding: 12px; margin: 12px 0; }
     .row { display:flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-    button, select { padding: 8px 10px; font-size: 14px; }
+    button, select, input { padding: 8px 10px; font-size: 14px; }
     .pill { padding: 2px 10px; border-radius: 999px; background: #eee; font-size: 12px; }
     .ok { background: #e7f7ea; }
     .bad { background: #ffecec; }
     button:disabled { opacity: 0.55; cursor: not-allowed; }
     table { width:100%; border-collapse: collapse; }
-    th, td { border-bottom: 1px solid #eee; padding: 6px 8px; text-align: left; font-size: 13px; }
+    th, td { border-bottom: 1px solid #eee; padding: 6px 8px; text-align: left; font-size: 13px; vertical-align: top; }
     th { background: #fafafa; position: sticky; top: 0; }
     .scroll { max-height: 260px; overflow:auto; border:1px solid #eee; border-radius:8px; margin-top:8px; }
+
+    /* ---- Modal ---- */
+    .overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.35);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      z-index: 9999;
+    }
+    .overlay.show { display: flex; }
+    .modal {
+      width: min(900px, 100%);
+      max-height: min(80vh, 720px);
+      background: #fff;
+      border: 1px solid var(--bd);
+      border-radius: 12px;
+      box-shadow: 0 12px 30px rgba(0,0,0,0.18);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .modalHeader {
+      padding: 12px 14px;
+      border-bottom: 1px solid #eee;
+      display:flex; align-items:center; gap:12px;
+    }
+    .modalTitle { font-weight: 700; }
+    .modalBody {
+      padding: 12px 14px;
+      overflow: auto;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      gap: 8px 12px;
+      align-items: center;
+    }
+    .grid label {
+      font-size: 12px;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .grid input {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      font-size: 14px;
+    }
+    .modalFooter {
+      padding: 12px 14px;
+      border-top: 1px solid #eee;
+      display:flex; gap:10px; justify-content: flex-end;
+      background: #fafafa;
+    }
+    .btn {
+      border: 1px solid #ddd;
+      background: #fff;
+      border-radius: 10px;
+      cursor: pointer;
+    }
+    .btnPrimary {
+      border-color: #0b6;
+      background: #0b6;
+      color: #fff;
+    }
+    .btnDanger {
+      border-color: #d33;
+      background: #d33;
+      color: #fff;
+    }
+    .btnSmall {
+      padding: 4px 8px;
+      font-size: 12px;
+      border-radius: 10px;
+    }
   </style>
 </head>
 <body>
   <h1>Agrident Tasks → CSV</h1>
-  <div class="muted">Connect → (auto sync tasks) → select task → (auto fetch headers + data) → download CSV.</div>
+  <div class="muted">Connect → (auto sync tasks) → select task → (auto fetch headers + data) → optionally edit/delete rows → download CSV.</div>
 
   <div class="card">
     <div class="row">
@@ -75,6 +155,31 @@
     </div>
   </div>
 
+  <!-- Modal editor -->
+  <div id="overlay" class="overlay" role="dialog" aria-modal="true" aria-hidden="true">
+    <div class="modal">
+      <div class="modalHeader">
+        <div class="modalTitle" id="modalTitle">Edit Row</div>
+        <span class="muted" id="modalSubtitle"></span>
+        <span style="margin-left:auto;"></span>
+        <button class="btn btnSmall" id="modalCloseBtn" title="Close">✕</button>
+      </div>
+
+      <div class="modalBody">
+        <div class="muted" style="margin-bottom:10px;">
+          Tip: Date columns accept <code>08022026</code>, <code>08-02-26</code>, <code>2026-02-08</code> and will export as <code>dd/mm/yyyy</code>.
+        </div>
+        <div id="modalGrid" class="grid"></div>
+      </div>
+
+      <div class="modalFooter">
+        <button class="btn" id="modalCancelBtn">Cancel</button>
+        <button class="btn btnDanger" id="modalDeleteBtn">Delete Row</button>
+        <button class="btn btnPrimary" id="modalSaveBtn">Save</button>
+      </div>
+    </div>
+  </div>
+
 <script>
 (() => {
   // BLE UUIDs
@@ -100,6 +205,16 @@
   const previewMeta = document.getElementById("previewMeta");
   const previewHead = document.getElementById("previewHead");
   const previewBody = document.getElementById("previewBody");
+
+  // Modal elements
+  const overlay = document.getElementById("overlay");
+  const modalTitle = document.getElementById("modalTitle");
+  const modalSubtitle = document.getElementById("modalSubtitle");
+  const modalGrid = document.getElementById("modalGrid");
+  const modalCloseBtn = document.getElementById("modalCloseBtn");
+  const modalCancelBtn = document.getElementById("modalCancelBtn");
+  const modalDeleteBtn = document.getElementById("modalDeleteBtn");
+  const modalSaveBtn = document.getElementById("modalSaveBtn");
 
   function setStatus(text, ok) {
     statusEl.textContent = text;
@@ -136,6 +251,12 @@
   let taskHeaders = [];
   let taskRows = [];
 
+  // Modal editing state
+  let editingRealIndex = null; // index into taskRows
+  let editingHeaders = [];
+  let editingInputs = []; // input elements
+  let lastFocusEl = null;
+
   // Helpers
   const isBracketFrame = (s) => s.startsWith("[") && s.endsWith("]");
   const isCmdFrame = (s, cmd) => s.startsWith("[" + cmd); // [XSH] and [XSH|0]
@@ -150,21 +271,18 @@
     if (!(y >= 1900 && y <= 2100)) return false;
     if (!(m >= 1 && m <= 12)) return false;
     if (!(d >= 1 && d <= 31)) return false;
-    // basic month/day sanity
     const dt = new Date(y, m - 1, d);
     return dt.getFullYear() === y && (dt.getMonth() + 1) === m && dt.getDate() === d;
   }
 
-  // Convert common Agrident-ish date shapes to dd/mm/yyyy.
-  // Keeps original if it can't parse confidently.
+  // Convert common date shapes to dd/mm/yyyy.
   function formatDateMaybe(v) {
     const s = String(v ?? "").trim();
     if (!s) return s;
 
-    // already dd/mm/yyyy
     if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)) return s;
 
-    // ddmmyyyy (e.g. 08022026)
+    // ddmmyyyy e.g. 08022026
     let m = s.match(/^(\d{2})(\d{2})(\d{4})$/);
     if (m) {
       const dd = m[1], mm = m[2], yyyy = m[3];
@@ -172,7 +290,7 @@
       return s;
     }
 
-    // ddmmyy (e.g. 080226 => 08/02/2026)
+    // ddmmyy e.g. 080226 -> 08/02/2026
     m = s.match(/^(\d{2})(\d{2})(\d{2})$/);
     if (m) {
       const dd = m[1], mm = m[2], yy = m[3];
@@ -200,7 +318,7 @@
       return s;
     }
 
-    // yyyy-mm-dd (or yyyy/mm/dd)
+    // yyyy-mm-dd or yyyy/mm/dd
     m = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/);
     if (m) {
       const yyyy = m[1], mm = pad2(m[2]), dd = pad2(m[3]);
@@ -208,7 +326,7 @@
       return s;
     }
 
-    // unix seconds / ms (if present)
+    // unix seconds / ms
     if (/^\d{10}$/.test(s) || /^\d{13}$/.test(s)) {
       const ms = s.length === 10 ? Number(s) * 1000 : Number(s);
       const d = new Date(ms);
@@ -220,12 +338,10 @@
     return s;
   }
 
-  // Trim leading zeros in numeric-looking fields (weights, ids, etc.)
-  // "00045" -> "45", "0000" -> "0", "00012.30" -> "12.30"
+  // Trim leading zeros in numeric-looking fields (weights)
   function trimLeadingZerosNumberMaybe(v) {
     const s = String(v ?? "").trim();
     if (!s) return s;
-
     if (!/^-?\d+(\.\d+)?$/.test(s)) return s;
 
     const neg = s.startsWith("-");
@@ -241,27 +357,129 @@
     }
   }
 
-  // Apply to a whole row.
-  // IMPORTANT: Only treat as date if header includes "date" (to avoid EID etc).
+  // Apply to a whole row: only treat as date if header includes "date"
   function formatRow(row, headers) {
     return row.map((v, i) => {
       const raw = String(v ?? "").trim();
       const h = String(headers?.[i] ?? "").toLowerCase();
 
-      // date columns: format ddmmyyyy etc.
-      if (h.includes("date")) {
-        return formatDateMaybe(raw);
-      }
-
-      // weight columns: trim leading zeros
-      if (h.includes("weight") || h.includes("kg") || h === "wgt") {
-        return trimLeadingZerosNumberMaybe(raw);
-      }
+      if (h.includes("date")) return formatDateMaybe(raw);
+      if (h.includes("weight") || h.includes("kg") || h === "wgt") return trimLeadingZerosNumberMaybe(raw);
 
       return raw;
     });
   }
 
+  function getHeadersForPreview() {
+    return taskHeaders.length
+      ? taskHeaders
+      : (taskRows.length ? Array.from({length: Math.max(...taskRows.map(r => r.length))}, (_,i)=>`Field${i+1}`) : []);
+  }
+
+  // ---- Modal editor ----
+  function openEditor(realIndex) {
+    const row = taskRows[realIndex];
+    if (!row) return;
+
+    lastFocusEl = document.activeElement;
+
+    editingRealIndex = realIndex;
+    editingHeaders = getHeadersForPreview();
+    editingInputs = [];
+
+    modalTitle.textContent = "Edit Row";
+    modalSubtitle.textContent = selectedTask
+      ? `Task ${selectedTask.idx}: ${selectedTask.name} — Row ${realIndex + 1}`
+      : `Row ${realIndex + 1}`;
+
+    modalGrid.innerHTML = "";
+
+    for (let i = 0; i < editingHeaders.length; i++) {
+      const h = editingHeaders[i];
+      const label = document.createElement("label");
+      label.title = h;
+      label.textContent = h;
+
+      const inp = document.createElement("input");
+      inp.type = "text";
+      inp.value = row[i] ?? "";
+      inp.dataset.colIndex = String(i);
+
+      // Quick keyboard UX:
+      // Enter -> save, Esc -> cancel
+      inp.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") { ev.preventDefault(); saveEditor(); }
+        if (ev.key === "Escape") { ev.preventDefault(); closeEditor(false); }
+      });
+
+      modalGrid.appendChild(label);
+      modalGrid.appendChild(inp);
+      editingInputs.push(inp);
+    }
+
+    overlay.classList.add("show");
+    overlay.setAttribute("aria-hidden", "false");
+    // focus first input
+    setTimeout(() => editingInputs[0]?.focus?.(), 0);
+  }
+
+  function closeEditor(keepFocus = true) {
+    overlay.classList.remove("show");
+    overlay.setAttribute("aria-hidden", "true");
+
+    editingRealIndex = null;
+    editingHeaders = [];
+    editingInputs = [];
+    modalGrid.innerHTML = "";
+
+    if (keepFocus && lastFocusEl && typeof lastFocusEl.focus === "function") {
+      setTimeout(() => lastFocusEl.focus(), 0);
+    }
+    lastFocusEl = null;
+  }
+
+  function saveEditor() {
+    if (editingRealIndex === null) return;
+    const idx = editingRealIndex;
+
+    const updated = editingHeaders.map((h, i) => editingInputs[i]?.value ?? "");
+    // Re-apply formatting so export stays consistent
+    taskRows[idx] = formatRow(updated, editingHeaders);
+
+    closeEditor(true);
+    renderPreview();
+  }
+
+  function deleteEditorRow() {
+    if (editingRealIndex === null) return;
+    const idx = editingRealIndex;
+    if (!confirm(`Delete row #${idx + 1}?`)) return;
+
+    taskRows.splice(idx, 1);
+    closeEditor(true);
+    renderPreview();
+  }
+
+  // Overlay click: clicking outside modal closes
+  overlay.addEventListener("click", (ev) => {
+    if (ev.target === overlay) closeEditor(true);
+  });
+
+  // Modal buttons
+  modalCloseBtn.addEventListener("click", () => closeEditor(true));
+  modalCancelBtn.addEventListener("click", () => closeEditor(true));
+  modalSaveBtn.addEventListener("click", saveEditor);
+  modalDeleteBtn.addEventListener("click", deleteEditorRow);
+
+  // Global Esc closes modal
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && overlay.classList.contains("show")) {
+      ev.preventDefault();
+      closeEditor(true);
+    }
+  });
+
+  // ---- Commands / BLE plumbing ----
   function beginCommand(name, okToken) {
     if (currentCommand) throw new Error(`Busy running ${currentCommand.name}`);
 
@@ -412,9 +630,7 @@
     previewHead.innerHTML = "";
     previewBody.innerHTML = "";
 
-    const headers = taskHeaders.length
-      ? taskHeaders
-      : (taskRows.length ? Array.from({length: Math.max(...taskRows.map(r => r.length))}, (_,i)=>`Field${i+1}`) : []);
+    const headers = getHeadersForPreview();
 
     for (const h of headers) {
       const th = document.createElement("th");
@@ -422,14 +638,46 @@
       previewHead.appendChild(th);
     }
 
+    const thActions = document.createElement("th");
+    thActions.textContent = "Actions";
+    previewHead.appendChild(thActions);
+
     const rowsToShow = taskRows.slice(0, 200);
-    for (const r of rowsToShow) {
+
+    // Visible row i maps to real index i (because we slice from 0)
+    // If you add sorting/filtering later, update this mapping.
+    for (let visIndex = 0; visIndex < rowsToShow.length; visIndex++) {
+      const realIndex = visIndex;
+      const r = rowsToShow[visIndex];
+
       const tr = document.createElement("tr");
       for (let i = 0; i < headers.length; i++) {
         const td = document.createElement("td");
         td.textContent = r[i] ?? "";
         tr.appendChild(td);
       }
+
+      const tdAct = document.createElement("td");
+
+      const editBtn = document.createElement("button");
+      editBtn.className = "btn btnSmall";
+      editBtn.textContent = "Edit";
+      editBtn.addEventListener("click", () => openEditor(realIndex));
+
+      const delBtn = document.createElement("button");
+      delBtn.className = "btn btnSmall btnDanger";
+      delBtn.textContent = "Delete";
+      delBtn.style.marginLeft = "6px";
+      delBtn.addEventListener("click", () => {
+        if (!confirm(`Delete row #${realIndex + 1}?`)) return;
+        taskRows.splice(realIndex, 1);
+        renderPreview();
+      });
+
+      tdAct.appendChild(editBtn);
+      tdAct.appendChild(delBtn);
+      tr.appendChild(tdAct);
+
       previewBody.appendChild(tr);
     }
 
@@ -473,7 +721,7 @@
     const done = await send("[XGTASK]", { name: "Sync tasks", okToken: "XGTASKOK" });
 
     const rows = done.frames
-      .filter(s => s.startsWith("[") && s.endsWith("]"))
+      .filter(isBracketFrame)
       .filter(fr => fr !== "[XGTASK]" && fr !== "[XGTASKOK]")
       .filter(fr => fr.includes("|"));
 
@@ -496,8 +744,8 @@
     const done = await send(`[XSH|${idx}]`, { name: "Get headers", okToken: "XSHOK" });
 
     const headerFrame = done.frames.find(fr =>
-      fr.startsWith("[") && fr.endsWith("]") &&
-      !fr.startsWith("[XSH") &&
+      isBracketFrame(fr) &&
+      !isCmdFrame(fr, "XSH") &&
       fr !== "[XSHOK]" &&
       fr.includes("|")
     );
@@ -509,8 +757,8 @@
     const done = await send(`[CSW|${idx}]`, { name: "Get data", okToken: "CSWOK" });
 
     const dataFrames = done.frames
-      .filter(fr => fr.startsWith("[") && fr.endsWith("]"))
-      .filter(fr => !fr.startsWith("[CSW"))
+      .filter(isBracketFrame)
+      .filter(fr => !isCmdFrame(fr, "CSW"))
       .filter(fr => fr !== "[CSWOK]");
 
     const datasetFrames = dataFrames.filter(fr => fr.includes("|"));
@@ -571,6 +819,7 @@
       connectBtn.disabled = true;
       disconnectBtn.disabled = false;
 
+      // reset state
       tasks = [];
       selectedTask = null;
       taskHeaders = [];
@@ -578,6 +827,7 @@
       renderTasks();
       renderPreview();
 
+      // sync once on connect
       await runXGTASK();
 
     } catch (e) {
@@ -587,6 +837,8 @@
   }
 
   function cleanup() {
+    closeEditor(false);
+
     try { battChar?.stopNotifications?.().catch(()=>{}); } catch {}
     battChar = null;
 
@@ -633,10 +885,7 @@
       .replace(/[^\w\-]+/g,"_")
       .slice(0, 60);
 
-    const headers = taskHeaders.length
-      ? taskHeaders
-      : (taskRows.length ? Array.from({length: Math.max(...taskRows.map(r => r.length))}, (_,i)=>`Field${i+1}`) : []);
-
+    const headers = getHeadersForPreview();
     const csv = toCsv(headers, taskRows);
     downloadText(`${safeName}.csv`, csv);
   });
