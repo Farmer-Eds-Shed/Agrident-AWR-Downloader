@@ -155,6 +155,7 @@
 
     /* --- Mobile improvements --- */
     @media (max-width: 640px) {
+      #connTypeRow { display: none; }
       body { margin: 12px; }
       h1 { font-size: 30px; }
       .card { padding: 10px; margin: 10px 0; }
@@ -193,7 +194,7 @@
 
   <!-- Connection / Status -->
   <div class="card cardCompact" id="connCard">
-    <div class="topRow">
+    <div class="topRow" id="connTypeRow">
       <label for="connType">Connection:</label>
       <select id="connType">
         <option value="ble">Bluetooth (BLE)</option>
@@ -353,6 +354,32 @@
   let editingHeaders = [];
   let editingInputs = [];
   let lastFocusEl = null;
+
+    function isMobileUI() {
+    // "coarse" catches touch devices; max-width matches your CSS breakpoint
+    return window.matchMedia("(pointer: coarse)").matches || window.matchMedia("(max-width: 640px)").matches;
+  }
+
+  function enforceBLEOnMobile() {
+    const mobile = isMobileUI();
+    const row = document.getElementById("connTypeRow");
+
+    if (mobile) {
+      // Force BLE
+      connType.value = "ble";
+      connType.disabled = true;
+      if (row) row.style.display = "none";
+      if (connHint) connHint.textContent = "Bluetooth (BLE)";
+    } else {
+      connType.disabled = false;
+      if (row) row.style.display = "";
+      updateConnHint();
+    }
+  }
+
+  // run on load + on resize/orientation changes
+  enforceBLEOnMobile();
+  window.addEventListener("resize", enforceBLEOnMobile);
 
   // ---- Transport abstraction ----
   const transport = {
@@ -1017,6 +1044,8 @@
       connectBtn.disabled = true;
       disconnectBtn.disabled = false;
       connType.disabled = true;
+
+      if (isMobileUI()) connType.value = "ble";
 
       // connect transport
       const kind = connType.value;
