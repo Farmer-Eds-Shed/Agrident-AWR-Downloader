@@ -17,6 +17,40 @@
     .bad { background: #ffecec; }
     button:disabled { opacity: 0.55; cursor: not-allowed; }
 
+    /* Compact connection card */
+    .cardCompact { padding: 10px 12px; }
+    .rowTight { gap: 8px; }
+    .btnRow { display:flex; gap: 8px; width: 100%; }
+    .btnRow button { flex: 1; }
+    .pillRow { display:flex; gap: 8px; align-items:center; flex-wrap: wrap; width: 100%; }
+
+    details.connMore {
+      width: 100%;
+      margin-top: 8px;
+      border-top: 1px solid #eee;
+      padding-top: 8px;
+    }
+    details.connMore > summary {
+      cursor: pointer;
+      list-style: none;
+      user-select: none;
+      font-size: 13px;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    details.connMore > summary::-webkit-details-marker { display: none; }
+    details.connMore > summary:after {
+      content: "▾";
+      margin-left: auto;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    details.connMore[open] > summary:after { content: "▴"; }
+    .connMeta { display:flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+    .connMeta span { display:inline-block; }
+
     /* tables */
     table { width:100%; border-collapse: collapse; min-width: 520px; }
     th, td {
@@ -120,23 +154,31 @@
     /* --- Mobile improvements --- */
     @media (max-width: 640px) {
       body { margin: 12px; }
-      h1 { font-size: 32px; }
+      h1 { font-size: 30px; }
 
-      .card { padding: 12px; }
+      /* tighter cards */
+      .card { padding: 10px; margin: 10px 0; }
 
-      /* stack rows */
+      /* keep connection card compact */
+      .cardCompact { padding: 10px; }
+
+      /* keep rows from auto-stacking everything */
       .row { flex-direction: column; align-items: stretch; }
       .row > * { width: 100%; }
 
-      /* pills / small info: let them wrap and not force weird spacing */
-      .pill { display: inline-block; width: fit-content; }
-      #deviceName, #syncedAt { display: block; width: 100%; }
+      /* BUT: connection buttons stay as a 2-up row */
+      .btnRow { flex-direction: row; }
+      .btnRow button { width: auto; }
 
-      /* make controls full width */
+      /* pills: tight inline, not huge */
+      .pillRow { flex-direction: row; width: 100%; }
+      .pill { width: fit-content; }
+
+      /* task controls full width */
       button, select, input { width: 100%; }
       #taskSelect { width: 100%; }
 
-      /* slightly taller preview on phones */
+      /* preview table slightly taller */
       .scroll { max-height: 360px; }
 
       /* modal grid becomes single column */
@@ -145,56 +187,49 @@
       .modalFooter { justify-content: stretch; }
       .modalFooter button { width: 100%; }
 
-      /* tables need easy horizontal scroll and less min-width */
-      table { min-width: 680px; } /* allow sideways scroll but keep columns readable */
+      /* tables need easy horizontal scroll */
+      table { min-width: 680px; }
     }
   </style>
 </head>
 <body>
   <h1>Agrident Tasks → CSV</h1>
-  <div class="muted">Connect → (auto sync tasks) → select task → (auto fetch headers + data) → optionally edit/delete rows → download CSV.</div>
+  <div class="muted">Agrident/Allflex Tasks Downloader</div>
 
-  <div class="card">
-    <div class="row">
+  <!-- Connection / Status (compact on mobile) -->
+  <div class="card cardCompact" id="connCard">
+    <div class="btnRow">
       <button id="connectBtn">Connect</button>
       <button id="disconnectBtn" disabled>Disconnect</button>
-      <span id="status" class="pill bad">Disconnected</span>
-      <span id="busy" class="pill">idle</span>
-      <span class="muted" id="deviceName"></span>
-      <span class="muted" style="margin-left:auto;" id="syncedAt"></span>
     </div>
 
-    <div class="row" style="margin-top:10px;">
-      <label class="muted">Task:</label>
+    <div class="pillRow" style="margin-top:8px;">
+      <span id="status" class="pill bad">Disconnected</span>
+      <span id="busy" class="pill">idle</span>
+    </div>
+
+    <details id="connMore" class="connMore">
+      <summary>Connection details</summary>
+      <div class="connMeta">
+        <span class="muted" id="deviceName"></span>
+        <span class="muted" id="syncedAt"></span>
+      </div>
+    </details>
+  </div>
+
+  <!-- Preview (task selection + download) -->
+  <div class="card">
+    <div class="row" style="gap:10px; margin-bottom:10px;">
+      <label class="muted" for="taskSelect">Task:</label>
       <select id="taskSelect" disabled>
         <option value="">(connect to load tasks)</option>
       </select>
       <button id="downloadCsvBtn" disabled>Download CSV</button>
     </div>
-  </div>
 
-  <div class="card">
-    <h3 style="margin:0 0 6px;">Tasks</h3>
-    <div class="muted">From <code>[XGTASK] ... [XGTASKOK]</code></div>
-    <div class="scroll">
-      <table>
-        <thead>
-          <tr>
-            <th>Index</th>
-            <th>Name</th>
-            <th>Prefix</th>
-            <th>Suffix</th>
-            <th>Count</th>
-          </tr>
-        </thead>
-        <tbody id="tasksBody"></tbody>
-      </table>
-    </div>
-  </div>
-
-  <div class="card">
     <h3 style="margin:0 0 6px;">Preview</h3>
     <div class="muted" id="previewMeta">No task selected.</div>
+
     <div class="scroll" style="max-height: 320px;">
       <table>
         <thead><tr id="previewHead"></tr></thead>
@@ -234,7 +269,7 @@
   const UUID_BATT_SVC = "battery_service";
   const UUID_BATT_CHR = "battery_level"; // 0x2A19
 
-  // Defaults: as per your testing
+  // Defaults
   const APPEND_CR = false;
   const APPEND_LF = false;
 
@@ -245,11 +280,11 @@
   const busyEl = document.getElementById("busy");
   const deviceNameEl = document.getElementById("deviceName");
   const syncedAtEl = document.getElementById("syncedAt");
+  const connMore = document.getElementById("connMore");
 
   const taskSelect = document.getElementById("taskSelect");
   const downloadCsvBtn = document.getElementById("downloadCsvBtn");
 
-  const tasksBody = document.getElementById("tasksBody");
   const previewMeta = document.getElementById("previewMeta");
   const previewHead = document.getElementById("previewHead");
   const previewBody = document.getElementById("previewBody");
@@ -263,6 +298,15 @@
   const modalCancelBtn = document.getElementById("modalCancelBtn");
   const modalDeleteBtn = document.getElementById("modalDeleteBtn");
   const modalSaveBtn = document.getElementById("modalSaveBtn");
+
+  // Open connection details by default on desktop, collapsed on mobile
+  function setConnDetailsDefault() {
+    if (!connMore) return;
+    if (window.matchMedia("(min-width: 641px)").matches) connMore.open = true;
+    else connMore.open = false;
+  }
+  setConnDetailsDefault();
+  window.addEventListener("resize", () => setConnDetailsDefault());
 
   function setStatus(text, ok) {
     statusEl.textContent = text;
@@ -280,15 +324,15 @@
   let device = null;
   let battChar = null;
 
-  // Frame buffer (robust bracket extraction)
+  // Frame buffer
   let rxText = "";
   const MAX_TEXT = 60000;
 
   // Command control
-  let currentCommand = null; // { name, okToken, frames, resolve, reject }
+  let currentCommand = null;
   let cmdTimer = null;
 
-  // Write queue (prevents "GATT operation already in progress.")
+  // Write queue
   const writeQueue = [];
   let writing = false;
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -300,14 +344,14 @@
   let taskRows = [];
 
   // Modal editing state
-  let editingRealIndex = null; // index into taskRows
+  let editingRealIndex = null;
   let editingHeaders = [];
-  let editingInputs = []; // input elements
+  let editingInputs = [];
   let lastFocusEl = null;
 
   // Helpers
   const isBracketFrame = (s) => s.startsWith("[") && s.endsWith("]");
-  const isCmdFrame = (s, cmd) => s.startsWith("[" + cmd); // [XSH] and [XSH|0]
+  const isCmdFrame = (s, cmd) => s.startsWith("[" + cmd);
   const isOkFrame = (s, okToken) => s.includes(okToken);
   const parsePipeFrame = (frameStr) => frameStr.slice(1, -1).split("|");
 
@@ -620,26 +664,7 @@
     return null;
   }
 
-  function esc(s) {
-    return String(s ?? "").replace(/[&<>"']/g, (m) => ({
-      "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#039;"
-    }[m]));
-  }
-
-  function renderTasks() {
-    tasksBody.innerHTML = "";
-    for (const t of tasks) {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td>${esc(t.idx)}</td>
-        <td>${esc(t.name)}</td>
-        <td>${esc(t.prefix)}</td>
-        <td>${esc(t.suffix)}</td>
-        <td>${esc(t.count)}</td>
-      `;
-      tasksBody.appendChild(tr);
-    }
-
+  function renderTasksDropdown() {
     taskSelect.innerHTML = "";
     if (!tasks.length) {
       taskSelect.appendChild(new Option("(no tasks found)", ""));
@@ -684,7 +709,6 @@
       }
 
       const tdAct = document.createElement("td");
-      // Stack buttons nicely (better on mobile)
       tdAct.style.display = "flex";
       tdAct.style.flexDirection = "column";
       tdAct.style.gap = "6px";
@@ -763,7 +787,7 @@
         count: a[4] ?? "",
       }));
 
-    renderTasks();
+    renderTasksDropdown();
     const now = new Date();
     syncedAtEl.textContent = `Synced: ${now.toLocaleString()}`;
   }
@@ -850,7 +874,7 @@
       selectedTask = null;
       taskHeaders = [];
       taskRows = [];
-      renderTasks();
+      renderTasksDropdown();
       renderPreview();
 
       await runXGTASK();
@@ -882,7 +906,7 @@
     selectedTask = null;
     taskHeaders = [];
     taskRows = [];
-    renderTasks();
+    renderTasksDropdown();
     renderPreview();
 
     setStatus("Disconnected", false);
