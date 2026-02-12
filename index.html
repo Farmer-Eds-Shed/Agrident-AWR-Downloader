@@ -19,10 +19,12 @@
 
     /* Compact connection card */
     .cardCompact { padding: 10px 12px; }
-    .rowTight { gap: 8px; }
     .btnRow { display:flex; gap: 8px; width: 100%; }
     .btnRow button { flex: 1; }
     .pillRow { display:flex; gap: 8px; align-items:center; flex-wrap: wrap; width: 100%; }
+    .topRow { display:flex; gap: 10px; align-items:center; flex-wrap: wrap; width: 100%; }
+    .topRow label { font-size: 13px; color: var(--muted); }
+    #connType { min-width: 220px; }
 
     details.connMore {
       width: 100%;
@@ -155,39 +157,32 @@
     @media (max-width: 640px) {
       body { margin: 12px; }
       h1 { font-size: 30px; }
-
-      /* tighter cards */
       .card { padding: 10px; margin: 10px 0; }
-
-      /* keep connection card compact */
       .cardCompact { padding: 10px; }
 
-      /* keep rows from auto-stacking everything */
       .row { flex-direction: column; align-items: stretch; }
       .row > * { width: 100%; }
 
-      /* BUT: connection buttons stay as a 2-up row */
+      /* keep connection buttons 2-up */
       .btnRow { flex-direction: row; }
       .btnRow button { width: auto; }
 
-      /* pills: tight inline, not huge */
+      /* keep connection type inline-ish */
+      .topRow { flex-direction: column; align-items: stretch; }
+      #connType { width: 100%; }
+
       .pillRow { flex-direction: row; width: 100%; }
       .pill { width: fit-content; }
 
-      /* task controls full width */
       button, select, input { width: 100%; }
       #taskSelect { width: 100%; }
 
-      /* preview table slightly taller */
       .scroll { max-height: 360px; }
-
-      /* modal grid becomes single column */
       .grid { grid-template-columns: 1fr; }
       .grid label { white-space: normal; }
       .modalFooter { justify-content: stretch; }
       .modalFooter button { width: 100%; }
 
-      /* tables need easy horizontal scroll */
       table { min-width: 680px; }
     }
   </style>
@@ -196,9 +191,18 @@
   <h1>Agrident Tasks → CSV</h1>
   <div class="muted">Agrident/Allflex Tasks Downloader</div>
 
-  <!-- Connection / Status (compact on mobile) -->
+  <!-- Connection / Status -->
   <div class="card cardCompact" id="connCard">
-    <div class="btnRow">
+    <div class="topRow">
+      <label for="connType">Connection:</label>
+      <select id="connType">
+        <option value="ble">Bluetooth (BLE)</option>
+        <option value="serial">USB Serial (COM)</option>
+      </select>
+      <span class="muted" id="connHint" style="margin-left:auto;"></span>
+    </div>
+
+    <div class="btnRow" style="margin-top:8px;">
       <button id="connectBtn">Connect</button>
       <button id="disconnectBtn" disabled>Disconnect</button>
     </div>
@@ -217,7 +221,7 @@
     </details>
   </div>
 
-  <!-- Preview (task selection + download) -->
+  <!-- Preview -->
   <div class="card">
     <div class="row" style="gap:10px; margin-bottom:10px;">
       <label class="muted" for="taskSelect">Task:</label>
@@ -269,11 +273,17 @@
   const UUID_BATT_SVC = "battery_service";
   const UUID_BATT_CHR = "battery_level"; // 0x2A19
 
+  // Serial defaults (you said 9600 is default)
+  const SERIAL_BAUD = 9600;
+
   // Defaults
   const APPEND_CR = false;
   const APPEND_LF = false;
 
   // UI
+  const connType = document.getElementById("connType");
+  const connHint = document.getElementById("connHint");
+
   const connectBtn = document.getElementById("connectBtn");
   const disconnectBtn = document.getElementById("disconnectBtn");
   const statusEl = document.getElementById("status");
@@ -299,7 +309,7 @@
   const modalDeleteBtn = document.getElementById("modalDeleteBtn");
   const modalSaveBtn = document.getElementById("modalSaveBtn");
 
-  // Open connection details by default on desktop, collapsed on mobile
+  // Open details by default on desktop, collapsed on mobile
   function setConnDetailsDefault() {
     if (!connMore) return;
     if (window.matchMedia("(min-width: 641px)").matches) connMore.open = true;
@@ -315,16 +325,11 @@
   }
   function setBusy(text) { busyEl.textContent = text; }
 
-  // Text/bytes
   const enc = new TextEncoder();
   const dec = new TextDecoder();
   function u8FromDV(dv) { return new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength); }
 
-  // BLE state
-  let device = null;
-  let battChar = null;
-
-  // Frame buffer
+  // Stream buffer for bracket frames
   let rxText = "";
   const MAX_TEXT = 60000;
 
@@ -332,7 +337,7 @@
   let currentCommand = null;
   let cmdTimer = null;
 
-  // Write queue
+  // Shared write queue (prevents overlapping writes on both transports)
   const writeQueue = [];
   let writing = false;
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -343,19 +348,289 @@
   let taskHeaders = [];
   let taskRows = [];
 
-  // Modal editing state
+  // Modal state
   let editingRealIndex = null;
   let editingHeaders = [];
   let editingInputs = [];
   let lastFocusEl = null;
 
-  // Helpers
+  // ---- Transport abstraction ----
+  const transport = {
+    kind: null,          // "ble" | "serial"
+    isConnected: false,
+    // ble
+    ble: { device: null, char: null, onNotify: null },
+    // serial
+    serial: { port: null, reader: null, keepReading: false },
+
+    async connect(kind) {
+      if (this.isConnected) throw new Error("Already connected");
+      this.kind = kind;
+
+      if (kind === "ble") return await this._connectBLE();
+      if (kind === "serial") return await this._connectSerial();
+      throw new Error("Unknown transport");
+    },
+
+    async disconnect() {
+      if (this.kind === "ble") await this._disconnectBLE();
+      if (this.kind === "serial") await this._disconnectSerial();
+      this.kind = null;
+      this.isConnected = false;
+    },
+
+    async write(str) {
+      if (!this.isConnected) throw new Error("Not connected");
+      if (this.kind === "ble") return await this._writeBLE(str);
+      if (this.kind === "serial") return await this._writeSerial(str);
+      throw new Error("Unknown transport");
+    },
+
+    // ----- BLE -----
+    async _connectBLE() {
+      if (!("bluetooth" in navigator)) {
+        throw new Error("Web Bluetooth not supported in this browser");
+      }
+
+      const dev = await navigator.bluetooth.requestDevice({
+        filters: [{ services: [UUID_BATT_SVC] }],
+        optionalServices: [UUID_BATT_SVC, "generic_access", "device_information"],
+      });
+
+      this.ble.device = dev;
+      deviceNameEl.textContent = dev.name ? `Selected: ${dev.name}` : `Selected: (BLE device)`;
+      dev.addEventListener("gattserverdisconnected", () => cleanup());
+
+      const server = await dev.gatt.connect();
+      const svc = await server.getPrimaryService(UUID_BATT_SVC);
+      const chr = await svc.getCharacteristic(UUID_BATT_CHR);
+      this.ble.char = chr;
+
+      await chr.startNotifications();
+      const onNotify = (ev) => {
+        const u8 = u8FromDV(ev.target.value);
+        const chunk = dec.decode(u8);
+        onTextChunk(chunk);
+      };
+      chr.addEventListener("characteristicvaluechanged", onNotify);
+      this.ble.onNotify = onNotify;
+
+      this.isConnected = true;
+    },
+
+    async _disconnectBLE() {
+      try {
+        if (this.ble.char && this.ble.onNotify) {
+          this.ble.char.removeEventListener("characteristicvaluechanged", this.ble.onNotify);
+        }
+      } catch {}
+      try { await this.ble.char?.stopNotifications?.().catch(()=>{}); } catch {}
+      try { if (this.ble.device?.gatt?.connected) this.ble.device.gatt.disconnect(); } catch {}
+
+      this.ble.device = null;
+      this.ble.char = null;
+      this.ble.onNotify = null;
+    },
+
+    async _writeBLE(str) {
+      if (!this.ble.char) throw new Error("BLE characteristic missing");
+      await this.ble.char.writeValue(enc.encode(str));
+      await sleep(35);
+    },
+
+    // ----- Serial -----
+    async _connectSerial() {
+      if (!("serial" in navigator)) {
+        throw new Error("Web Serial not supported (use Chrome/Edge on desktop)");
+      }
+
+      const port = await navigator.serial.requestPort();
+      await port.open({ baudRate: SERIAL_BAUD });
+
+      this.serial.port = port;
+      this.serial.keepReading = true;
+
+      // Best-effort display info
+      const info = port.getInfo ? port.getInfo() : null;
+      if (info && (info.usbVendorId || info.usbProductId)) {
+        deviceNameEl.textContent = `Serial: USB VID ${info.usbVendorId || "?"} PID ${info.usbProductId || "?"} @ ${SERIAL_BAUD}`;
+      } else {
+        deviceNameEl.textContent = `Serial: Connected @ ${SERIAL_BAUD}`;
+      }
+
+      // Start read loop
+      this.serial.reader = port.readable.getReader();
+      this.isConnected = true;
+
+      (async () => {
+        try {
+          while (this.serial.keepReading) {
+            const { value, done } = await this.serial.reader.read();
+            if (done) break;
+            if (value) {
+              // value is Uint8Array
+              const chunk = dec.decode(value);
+              onTextChunk(chunk);
+            }
+          }
+        } catch (e) {
+          // If cable pulled / port error, cleanup
+          cleanup();
+        }
+      })();
+    },
+
+    async _disconnectSerial() {
+      this.serial.keepReading = false;
+
+      try { await this.serial.reader?.cancel?.(); } catch {}
+      try { this.serial.reader?.releaseLock?.(); } catch {}
+      this.serial.reader = null;
+
+      try { await this.serial.port?.close?.(); } catch {}
+      this.serial.port = null;
+    },
+
+    async _writeSerial(str) {
+      const port = this.serial.port;
+      if (!port?.writable) throw new Error("Serial port not writable");
+
+      const writer = port.writable.getWriter();
+      try {
+        await writer.write(enc.encode(str));
+      } finally {
+        writer.releaseLock();
+      }
+      await sleep(20);
+    }
+  };
+
+  function onTextChunk(chunk) {
+    rxText += chunk;
+    if (rxText.length > MAX_TEXT) rxText = rxText.slice(-MAX_TEXT);
+    consumeFrames();
+  }
+
+  // ---- Frame extraction ----
   const isBracketFrame = (s) => s.startsWith("[") && s.endsWith("]");
-  const isCmdFrame = (s, cmd) => s.startsWith("[" + cmd);
+  const isCmdFrame = (s, cmd) => s.startsWith("[" + cmd); // [XSH] and [XSH|0]
   const isOkFrame = (s, okToken) => s.includes(okToken);
   const parsePipeFrame = (frameStr) => frameStr.slice(1, -1).split("|");
 
-  // ---- Field formatting ----
+  function consumeFrames() {
+    while (true) {
+      const open = rxText.indexOf("[");
+      if (open === -1) {
+        if (rxText.length > 1024) rxText = rxText.slice(-256);
+        return;
+      }
+      const close = rxText.indexOf("]", open);
+      if (close === -1) return;
+
+      const raw = rxText.slice(open, close + 1);
+      rxText = rxText.slice(close + 1);
+
+      const cleaned = raw.replace(/\r/g,"").replace(/\n/g,"");
+      onFrame(cleaned);
+    }
+  }
+
+  // ---- Command plumbing (unchanged) ----
+  function beginCommand(name, okToken) {
+    if (currentCommand) throw new Error(`Busy running ${currentCommand.name}`);
+
+    let resolve, reject;
+    const p = new Promise((res, rej) => { resolve = res; reject = rej; });
+
+    currentCommand = { name, okToken, frames: [], resolve, reject };
+    setBusy(name);
+
+    connectBtn.disabled = true;
+    disconnectBtn.disabled = false;
+    connType.disabled = true;
+    taskSelect.disabled = true;
+    downloadCsvBtn.disabled = true;
+
+    if (cmdTimer) clearTimeout(cmdTimer);
+    cmdTimer = setTimeout(() => {
+      const done = currentCommand;
+      currentCommand = null;
+      setBusy("idle");
+      if (done) done.reject(new Error("Timeout"));
+      taskSelect.disabled = !(transport.isConnected && tasks.length);
+      downloadCsvBtn.disabled = !(transport.isConnected && taskRows.length);
+    }, 12000);
+
+    return p;
+  }
+
+  function finishCommand(ok, err) {
+    if (!currentCommand) return;
+    if (cmdTimer) clearTimeout(cmdTimer);
+    cmdTimer = null;
+
+    const done = currentCommand;
+    currentCommand = null;
+
+    setBusy("idle");
+    connectBtn.disabled = true;
+    disconnectBtn.disabled = false;
+    connType.disabled = true;
+    taskSelect.disabled = !(transport.isConnected && tasks.length);
+    downloadCsvBtn.disabled = !(transport.isConnected && taskRows.length);
+
+    if (ok) done.resolve(done);
+    else done.reject(err || new Error("Command failed"));
+  }
+
+  function onFrame(f) {
+    if (!currentCommand) return;
+    currentCommand.frames.push(f);
+    if (isOkFrame(f, currentCommand.okToken)) finishCommand(true);
+  }
+
+  async function enqueueWrite(str) {
+    writeQueue.push(str);
+    pumpWrites();
+  }
+
+  async function pumpWrites() {
+    if (writing) return;
+    writing = true;
+    try {
+      while (writeQueue.length) {
+        const s = writeQueue.shift();
+        await transport.write(s);
+      }
+    } catch (e) {
+      if (currentCommand) finishCommand(false, e);
+      throw e;
+    } finally {
+      writing = false;
+    }
+  }
+
+  async function send(cmd, structured = null) {
+    if (!transport.isConnected) throw new Error("Not connected");
+
+    let out = String(cmd).trim();
+    if (!out) return null;
+
+    if (!out.startsWith("[")) out = "[" + out;
+    if (!out.endsWith("]")) out += "]";
+
+    if (APPEND_CR) out += "\r";
+    if (APPEND_LF) out += "\n";
+
+    let p = null;
+    if (structured) p = beginCommand(structured.name, structured.okToken);
+
+    await enqueueWrite(out);
+    if (p) return await p;
+    return null;
+  }
+
+  // ---- Field formatting (unchanged) ----
   function pad2(n) { return String(n).padStart(2, "0"); }
 
   function isValidDMY(dd, mm, yyyy) {
@@ -457,7 +732,7 @@
       : (taskRows.length ? Array.from({length: Math.max(...taskRows.map(r => r.length))}, (_,i)=>`Field${i+1}`) : []);
   }
 
-  // ---- Modal editor ----
+  // ---- Modal editor (unchanged) ----
   function openEditor(realIndex) {
     const row = taskRows[realIndex];
     if (!row) return;
@@ -552,118 +827,7 @@
     }
   });
 
-  // ---- Commands / BLE plumbing ----
-  function beginCommand(name, okToken) {
-    if (currentCommand) throw new Error(`Busy running ${currentCommand.name}`);
-
-    let resolve, reject;
-    const p = new Promise((res, rej) => { resolve = res; reject = rej; });
-
-    currentCommand = { name, okToken, frames: [], resolve, reject };
-    setBusy(name);
-
-    connectBtn.disabled = true;
-    disconnectBtn.disabled = false;
-    taskSelect.disabled = true;
-    downloadCsvBtn.disabled = true;
-
-    if (cmdTimer) clearTimeout(cmdTimer);
-    cmdTimer = setTimeout(() => {
-      const done = currentCommand;
-      currentCommand = null;
-      setBusy("idle");
-      if (done) done.reject(new Error("Timeout"));
-      taskSelect.disabled = !(battChar && tasks.length);
-      downloadCsvBtn.disabled = !(battChar && taskRows.length);
-    }, 12000);
-
-    return p;
-  }
-
-  function finishCommand(ok, err) {
-    if (!currentCommand) return;
-    if (cmdTimer) clearTimeout(cmdTimer);
-    cmdTimer = null;
-
-    const done = currentCommand;
-    currentCommand = null;
-
-    setBusy("idle");
-    connectBtn.disabled = true;
-    disconnectBtn.disabled = false;
-    taskSelect.disabled = !(battChar && tasks.length);
-    downloadCsvBtn.disabled = !(battChar && taskRows.length);
-
-    if (ok) done.resolve(done);
-    else done.reject(err || new Error("Command failed"));
-  }
-
-  function onFrame(f) {
-    if (!currentCommand) return;
-    currentCommand.frames.push(f);
-    if (isOkFrame(f, currentCommand.okToken)) finishCommand(true);
-  }
-
-  function consumeFrames() {
-    while (true) {
-      const open = rxText.indexOf("[");
-      if (open === -1) {
-        if (rxText.length > 1024) rxText = rxText.slice(-256);
-        return;
-      }
-      const close = rxText.indexOf("]", open);
-      if (close === -1) return;
-
-      const raw = rxText.slice(open, close + 1);
-      rxText = rxText.slice(close + 1);
-
-      const cleaned = raw.replace(/\r/g,"").replace(/\n/g,"");
-      onFrame(cleaned);
-    }
-  }
-
-  async function enqueueWrite(str) {
-    if (!battChar) throw new Error("Not connected");
-    writeQueue.push(str);
-    pumpWrites();
-  }
-
-  async function pumpWrites() {
-    if (writing) return;
-    writing = true;
-    try {
-      while (writeQueue.length) {
-        const s = writeQueue.shift();
-        await battChar.writeValue(enc.encode(s));
-        await sleep(35);
-      }
-    } catch (e) {
-      if (currentCommand) finishCommand(false, e);
-    } finally {
-      writing = false;
-    }
-  }
-
-  async function send(cmd, structured = null) {
-    if (!battChar) throw new Error("Not connected");
-
-    let out = String(cmd).trim();
-    if (!out) return null;
-
-    if (!out.startsWith("[")) out = "[" + out;
-    if (!out.endsWith("]")) out += "]";
-
-    if (APPEND_CR) out += "\r";
-    if (APPEND_LF) out += "\n";
-
-    let p = null;
-    if (structured) p = beginCommand(structured.name, structured.okToken);
-
-    await enqueueWrite(out);
-    if (p) return await p;
-    return null;
-  }
-
+  // ---- UI rendering ----
   function renderTasksDropdown() {
     taskSelect.innerHTML = "";
     if (!tasks.length) {
@@ -742,7 +906,7 @@
         `Task ${selectedTask.idx}: ${selectedTask.name} — ${taskRows.length} record(s), ${headers.length} column(s).`;
     }
 
-    downloadCsvBtn.disabled = !(battChar && taskRows.length);
+    downloadCsvBtn.disabled = !(transport.isConnected && taskRows.length);
   }
 
   function toCsv(headers, rows) {
@@ -769,6 +933,7 @@
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
+  // ---- Agrident commands ----
   async function runXGTASK() {
     const done = await send("[XGTASK]", { name: "Sync tasks", okToken: "XGTASKOK" });
 
@@ -834,49 +999,33 @@
     renderPreview();
   }
 
+  // ---- Connect / Disconnect ----
   async function connect() {
-    if (!("bluetooth" in navigator)) {
-      alert("Web Bluetooth not supported in this browser.");
-      return;
-    }
     try {
       setStatus("Connecting…", false);
       setBusy("connecting");
 
-      device = await navigator.bluetooth.requestDevice({
-        filters: [{ services: [UUID_BATT_SVC] }],
-        optionalServices: [UUID_BATT_SVC, "generic_access", "device_information"],
-      });
-
-      deviceNameEl.textContent = device.name ? `Selected: ${device.name}` : "";
-      device.addEventListener("gattserverdisconnected", () => cleanup());
-
-      const server = await device.gatt.connect();
-      const svc = await server.getPrimaryService(UUID_BATT_SVC);
-      battChar = await svc.getCharacteristic(UUID_BATT_CHR);
-
-      await battChar.startNotifications();
-      battChar.addEventListener("characteristicvaluechanged", (ev) => {
-        const u8 = u8FromDV(ev.target.value);
-        const chunk = dec.decode(u8);
-        rxText += chunk;
-        if (rxText.length > MAX_TEXT) rxText = rxText.slice(-MAX_TEXT);
-        consumeFrames();
-      });
-
-      setStatus("Connected", true);
-      setBusy("idle");
-
-      connectBtn.disabled = true;
-      disconnectBtn.disabled = false;
-
+      // clear UI state
       tasks = [];
       selectedTask = null;
       taskHeaders = [];
       taskRows = [];
+      rxText = "";
       renderTasksDropdown();
       renderPreview();
 
+      connectBtn.disabled = true;
+      disconnectBtn.disabled = false;
+      connType.disabled = true;
+
+      // connect transport
+      const kind = connType.value;
+      await transport.connect(kind);
+
+      setStatus("Connected", true);
+      setBusy("idle");
+
+      // load tasks
       await runXGTASK();
 
     } catch (e) {
@@ -885,22 +1034,20 @@
     }
   }
 
-  function cleanup() {
+  async function cleanup() {
     closeEditor(false);
 
-    try { battChar?.stopNotifications?.().catch(()=>{}); } catch {}
-    battChar = null;
-
-    try { if (device?.gatt?.connected) device.gatt.disconnect(); } catch {}
-    device = null;
+    try { await transport.disconnect(); } catch {}
 
     connectBtn.disabled = false;
     disconnectBtn.disabled = true;
+    connType.disabled = false;
     taskSelect.disabled = true;
     downloadCsvBtn.disabled = true;
 
     deviceNameEl.textContent = "";
     syncedAtEl.textContent = "";
+    rxText = "";
 
     tasks = [];
     selectedTask = null;
@@ -913,6 +1060,22 @@
     setBusy("idle");
   }
 
+  // ---- Connection type hints ----
+  function updateConnHint() {
+    if (connType.value === "serial") {
+      connHint.textContent = ("serial" in navigator)
+        ? "Chrome/Edge desktop (Web Serial)"
+        : "Serial not supported in this browser";
+    } else {
+      connHint.textContent = ("bluetooth" in navigator)
+        ? "Chrome/Edge/Android (Web Bluetooth)"
+        : "Bluetooth not supported in this browser";
+    }
+  }
+  connType.addEventListener("change", updateConnHint);
+  updateConnHint();
+
+  // ---- Events ----
   connectBtn.addEventListener("click", connect);
   disconnectBtn.addEventListener("click", cleanup);
 
@@ -938,6 +1101,7 @@
     downloadText(`${safeName}.csv`, csv);
   });
 
+  // initial
   setStatus("Disconnected", false);
   setBusy("idle");
 })();
